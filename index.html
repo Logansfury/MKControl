@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MKControl Receiver</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    color: #fff;
+    font-family: 'Arial', sans-serif;
+    overflow: hidden;
+  }
+
+  #stage {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+
+  #status-line {
+    position: absolute;
+    top: 24px;
+    left: 24px;
+    font-size: 20px;
+    color: #888;
+  }
+
+  #art {
+    width: 320px;
+    height: 320px;
+    object-fit: cover;
+    border-radius: 8px;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+    background: #111;
+    margin-bottom: 36px;
+    display: none;
+  }
+
+  #title {
+    font-size: 42px;
+    font-weight: bold;
+    text-align: center;
+    margin-bottom: 8px;
+    max-width: 90vw;
+  }
+
+  #artist {
+    font-size: 28px;
+    color: #ccc;
+    text-align: center;
+    margin-bottom: 40px;
+    max-width: 90vw;
+  }
+
+  #lyric {
+    font-size: 34px;
+    font-weight: bold;
+    text-align: center;
+    max-width: 85vw;
+    min-height: 44px;
+    text-shadow: 0 2px 6px rgba(0,0,0,0.8);
+    transition: opacity 0.15s ease-in-out;
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <div id="status-line">MKControl Receiver - waiting for cast...</div>
+  <img id="art" src="" alt="">
+  <div id="title"></div>
+  <div id="artist"></div>
+  <div id="lyric"></div>
+  <div id="debug-overlay" style="position:absolute; bottom:8px; left:8px; font-size:12px; color:#0f0; font-family:monospace; max-width:96vw; white-space:pre-wrap; opacity:0.85;"></div>
+</div>
+
+<script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<script>
+window.onerror = function (msg, url, line, col, err) {
+  try {
+    var el = document.getElementById('debug-overlay');
+    if (el) {
+      el.style.color = '#f55';
+      el.textContent = 'JS ERROR: ' + msg + '  @' + line + ':' + col + '  ' + (url || '');
+    }
+  } catch (e) {}
+};
+
+(function () {
+  var statusEl = document.getElementById('status-line');
+  var artEl = document.getElementById('art');
+  var titleEl = document.getElementById('title');
+  var artistEl = document.getElementById('artist');
+  var lyricEl = document.getElementById('lyric');
+  var debugEl = document.getElementById('debug-overlay');
+
+  var context = cast.framework.CastReceiverContext.getInstance();
+  var playerManager = context.getPlayerManager();
+
+  // Lyrics are delivered by plain HTTP polling against MKControl's own LAN
+  // server (the same one already serving /audio and /art rock-solid), not
+  // through Cast's custom-message channel. That channel consistently killed
+  // playback shortly after the first message across extensive testing on
+  // this hardware; polling sidesteps the Cast protocol entirely for this.
+  var lyricPollUrl = null;
+  var lyricPollTimer = null;
+  var mediaStatusEventCount = 0;
+
+  function setNowPlayingFromMediaInfo(mediaInfo) {
+    try {
+      mediaStatusEventCount++;
+
+      var contentId = (mediaInfo && mediaInfo.contentId) || '';
+      var isComposedVideo = /\/stream(\?.*)?$/.test(contentId);
+
+      if (isComposedVideo) {
+        // The real composited video (from the ffmpeg-based engine) already
+        // has album art, title, artist, and lyrics baked directly into its
+        // frames - showing our own overlay on top would be redundant and
+        // could visually conflict with it. Just get out of the way and let
+        // the native video fill the screen.
+        statusEl.style.display = 'none';
+        titleEl.style.display = 'none';
+        artistEl.style.display = 'none';
+        artEl.style.display = 'none';
+        lyricEl.style.display = 'none';
+        updateDebugOverlay('composed video playing: contentId=' + contentId);
+        return;
+      }
+
+      var metadata = (mediaInfo && mediaInfo.metadata) || {};
+      titleEl.textContent = metadata.title || contentId || '';
+      artistEl.textContent = metadata.artist || metadata.albumArtist || '';
+
+      var images = metadata.images || [];
+      if (images.length > 0 && images[0].url) {
+        artEl.src = images[0].url;
+        artEl.style.display = 'block';
+      } else {
+        artEl.style.display = 'none';
+      }
+
+      statusEl.style.display = 'none';
+
+      // MKControl sends this via MediaInformation.customData now, not
+      // metadata - metadata is a fixed schema (MusicTrackMediaMetadata) and
+      // non-standard keys were very likely being silently dropped by the
+      // platform before ever reaching this page. customData is the correct
+      // pass-through field for sender-defined data like this.
+      var customData = (mediaInfo && mediaInfo.customData) || {};
+      if (typeof customData.lyricUrl === 'string' && customData.lyricUrl) {
+        lyricPollUrl = customData.lyricUrl;
+      }
+
+      if (lyricPollUrl && !lyricPollTimer) {
+        lyricPollTimer = setInterval(pollLyric, 500);
+      }
+
+      updateDebugOverlay('loaded: contentId=' + contentId);
+    } catch (e) {
+      console.error('setNowPlayingFromMediaInfo failed', e);
+      updateDebugOverlay('setNowPlayingFromMediaInfo EXCEPTION: ' + e);
+    }
+  }
+
+  function updateDebugOverlay(extra) {
+    if (!debugEl) return;
+    var lines = [
+      'events=' + mediaStatusEventCount,
+      'lyricPollUrl=' + (lyricPollUrl || 'NONE'),
+      'lastPoll=' + (window.__lastPollResult || 'none yet'),
+    ];
+    if (extra) lines.push(extra);
+    debugEl.textContent = lines.join(' | ');
+  }
+
+  function pollLyric() {
+    if (!lyricPollUrl) return;
+    fetch(lyricPollUrl, { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        window.__lastPollResult = 'OK @ ' + new Date().toLocaleTimeString();
+        if (typeof data.lyric === 'string') {
+          lyricEl.textContent = data.lyric;
+        }
+        updateDebugOverlay();
+      })
+      .catch(function (e) {
+        window.__lastPollResult = 'FAILED: ' + e;
+        updateDebugOverlay();
+      });
+  }
+
+  // Native playback is entirely handled by PlayerManager already - this just
+  // updates our custom UI whenever a new track is loaded or media status
+  // changes, using the same metadata MKControl already sends in play_media().
+  playerManager.addEventListener(
+    cast.framework.events.EventType.MEDIA_STATUS,
+    function (event) {
+      try {
+        var mediaInformation = playerManager.getMediaInformation();
+        if (mediaInformation) {
+          setNowPlayingFromMediaInfo(mediaInformation);
+        }
+      } catch (e) {
+        console.error('MEDIA_STATUS handler failed', e);
+      }
+    }
+  );
+
+  var options = new cast.framework.CastReceiverOptions();
+  var heartbeat = 0;
+  setInterval(function () {
+    heartbeat++;
+    if (mediaStatusEventCount === 0) {
+      updateDebugOverlay('heartbeat=' + heartbeat + ' (page alive, still no MEDIA_STATUS)');
+    }
+  }, 1000);
+
+  updateDebugOverlay('page loaded, waiting for LOAD message');
+  context.start(options);
+})();
+</script>
+
+</body>
+</html>
